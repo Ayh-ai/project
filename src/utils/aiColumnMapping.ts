@@ -1,14 +1,22 @@
-// upload.js
-import axios from "axios";
-import dotenv from "dotenv";
-import express from "express";
-import fs from "fs";
-import multer from "multer";
-import path from "path";
-import xlsx from "xlsx";
+// utils/aiColumnMapping.ts
+import { read, utils } from "xlsx";
 
-//todo  Industry-specific column patterns for better matching
-const industryPatterns = {
+export interface ColumnMapping {
+  originalName: string;
+  suggestedName: string;
+  confidence: number;
+  category: string;
+}
+
+export interface MappingResult {
+  mappings: ColumnMapping[];
+  unmappedColumns: string[];
+  industryType: string;
+  confidence: number;
+}
+
+// Industry-specific column patterns for better matching
+export const industryPatterns = {
   retail: {
     patterns: [
       {
@@ -562,392 +570,186 @@ const industryPatterns = {
   },
 };
 
-dotenv.config();
+function calculateSimilarity(str1: string, str2: string): number {
+  const s1 = str1.toLowerCase().replace(/[^a-z0-9]/g, "");
+  const s2 = str2.toLowerCase().replace(/[^a-z0-9]/g, "");
 
-const router = express.Router();
+  if (s1 === s2) return 1.0;
 
-// Multer storage configuration
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    // Ensure the 'uploads/' directory exists
-    const uploadDir = "uploads/";
-    if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir, { recursive: true }); // Create directory if it doesn't exist
-    }
-    cb(null, uploadDir);
-  },
-  filename: (req, file, cb) => {
-    // Create a unique filename by prepending a timestamp
-    cb(null, Date.now() + "-" + file.originalname);
-  },
-});
+  const matrix = Array(s2.length + 1)
+    .fill(null)
+    .map(() => Array(s1.length + 1).fill(null));
 
-// File filter to allow only specified spreadsheet types
-const fileFilter = (req, file, cb) => {
-  const allowedTypes = [".csv", ".xls", ".xlsx"];
-  const ext = path.extname(file.originalname).toLowerCase(); // Convert to lowercase for consistent checking
-  if (allowedTypes.includes(ext)) {
-    cb(null, true); // Accept the file
-  } else {
-    // Reject the file with an error message
-    cb(
-      new Error("Invalid file type. Only .csv, .xls, .xlsx are allowed!"),
-      false
-    );
-  }
-};
+  for (let i = 0; i <= s1.length; i++) matrix[0][i] = i;
+  for (let j = 0; j <= s2.length; j++) matrix[j][0] = j;
 
-const upload = multer({
-  storage,
-  fileFilter,
-  limits: { fileSize: 50 * 1024 * 1024 },
-});
-
-// Helper function to remove columns from data
-const removeColumnsFromData = (data, columnsToDelete) => {
-  if (!Array.isArray(data) || data.length === 0) return data;
-
-  return data.map((row) => {
-    const newRow = { ...row };
-    columnsToDelete.forEach((column) => {
-      delete newRow[column];
-    });
-    return newRow;
-  });
-};
-
-// Helper function to apply column mapping
-const applyColumnMapping = (data, columnMapping) => {
-  if (!Array.isArray(data) || data.length === 0) return data;
-
-  return data.map((row) => {
-    const newRow = {};
-    Object.keys(row).forEach((oldKey) => {
-      const newKey = columnMapping[oldKey] || oldKey;
-      newRow[newKey] = row[oldKey];
-    });
-    return newRow;
-  });
-};
-
-// POST /api/upload route to handle file uploads and analysis
-router.post("/upload", upload.single("file"), async (req, res) => {
-  let filePath; // Declare filePath here to ensure it's accessible in the finally block for cleanup
-
-  try {
-    if (!req.file) {
-      // No file was uploaded
-      return res.status(400).json({ message: "No file uploaded!" });
-    }
-
-    filePath = path.join("uploads", req.file.filename);
-    console.log("File uploaded to:", filePath);
-
-    // Read the uploaded file using xlsx
-    const workbook = xlsx.readFile(filePath);
-    // Assuming we're interested in the first sheet for analysis
-    const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-
-    // Convert the sheet data to a CSV string. This is generally a good
-    // format for sending tabular data to LLMs as it preserves structure.
-    const csvData = xlsx.utils.sheet_to_csv(sheet);
-
-    // Construct the prompt for the Gemini API
-    // Provide clear instructions and structure for the desired output
-    const prompt = `You are a financial analyst specializing in small business data.
-        Analyze the following spreadsheet data, provided in CSV format, and identify key trends,
-        potential issues, and opportunities. Provide actionable advice and clear recommendations
-        for the small business owner.
-
-        --- CSV Data ---
-        ${csvData}
-        --- End CSV Data ---
-
-        Please structure your analysis into distinct sections:
-        1. Executive Summary: A brief overview of the key findings.
-        2. Key Financial Metrics & Trends: Highlight important numbers and trends observed in the data.
-        3. Strengths and Opportunities: What's working well and where can the business grow?
-        4. Weaknesses and Risks: What are the challenges and potential threats?
-        5. Actionable Recommendations: Specific steps the business owner can take.
-        `;
-
-    console.log(
-      "Prompt sent to Gemini (first 500 characters):",
-      prompt.substring(0, 500) + "..."
-    );
-
-    // Call the Gemini API to generate content
-    const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyCxdJ8VnlRcvSQBEPRJ9NEMqcfmr7j0NcQ`,
-      {
-        contents: [
-          {
-            parts: [{ text: prompt }],
-          },
-        ],
-      }
-    );
-
-    console.log("Gemini API response status:", geminiRes.status);
-
-    // Extract the advice from the Gemini API response
-    const advice =
-      geminiRes?.data?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      "Gemini did not return advice.";
-
-    console.log(
-      "Advice received (first 200 characters):",
-      advice.substring(0, 200) + "..."
-    );
-
-    // Send a success response back to the client
-    res.status(200).json({
-      message: "File uploaded and analyzed successfully!",
-      filename: req.file.filename, // Optionally send back the filename
-      advice, // The analysis and advice from Gemini
-    });
-  } catch (err) {
-    console.error("Upload or analysis failed:", err);
-
-    // More detailed error handling for Axios specific errors (e.g., API issues)
-    if (axios.isAxiosError(err)) {
-      console.error(
-        "Axios error details (response data):",
-        err.response?.data || err.message
+  for (let j = 1; j <= s2.length; j++) {
+    for (let i = 1; i <= s1.length; i++) {
+      const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+      matrix[j][i] = Math.min(
+        matrix[j][i - 1] + 1,
+        matrix[j - 1][i] + 1,
+        matrix[j - 1][i - 1] + indicator
       );
-      res.status(err.response?.status || 500).json({
-        message: "Gemini API call failed",
-        error: err.response?.data || err.message, // Send specific API error details if available
+    }
+  }
+
+  const maxLength = Math.max(s1.length, s2.length);
+  return maxLength === 0
+    ? 1.0
+    : (maxLength - matrix[s2.length][s1.length]) / maxLength;
+}
+
+// Detect industry type based on column names
+function detectIndustryType(headers: string[]): {
+  industry: string;
+  confidence: number;
+} {
+  const industryScores: { [key: string]: number } = {};
+
+  Object.keys(industryPatterns).forEach((industry) => {
+    let score = 0;
+    const patterns =
+      industryPatterns[industry as keyof typeof industryPatterns].patterns;
+
+    headers.forEach((header) => {
+      const bestMatch = patterns.reduce((best, pattern) => {
+        const maxSimilarity = Math.max(
+          ...pattern.names.map((name) => calculateSimilarity(header, name))
+        );
+        return maxSimilarity > best ? maxSimilarity : best;
+      }, 0);
+
+      score += bestMatch;
+    });
+
+    industryScores[industry] = score / headers.length;
+  });
+
+  const bestIndustry = Object.keys(industryScores).reduce((a, b) =>
+    industryScores[a] > industryScores[b] ? a : b
+  );
+
+  return {
+    industry: bestIndustry,
+    confidence: industryScores[bestIndustry],
+  };
+}
+
+export function mapColumnsWithAI(
+  headers: string[],
+  industryHint?: string
+): MappingResult {
+  const detectedIndustry = industryHint || detectIndustryType(headers).industry;
+  const patterns =
+    industryPatterns[detectedIndustry as keyof typeof industryPatterns]
+      ?.patterns || [];
+
+  const mappings: ColumnMapping[] = [];
+  const unmappedColumns: string[] = [];
+
+  headers.forEach((header) => {
+    let bestMatch = { target: "", confidence: 0, category: "" };
+
+    patterns.forEach((pattern) => {
+      const similarities = pattern.names.map((name) =>
+        calculateSimilarity(header, name)
+      );
+      const maxSimilarity = Math.max(...similarities);
+
+      if (maxSimilarity > bestMatch.confidence && maxSimilarity > 0.6) {
+        bestMatch = {
+          target: pattern.target,
+          confidence: maxSimilarity,
+          category: pattern.category,
+        };
+      }
+    });
+
+    if (bestMatch.confidence > 0.6) {
+      mappings.push({
+        originalName: header,
+        suggestedName: bestMatch.target,
+        confidence: bestMatch.confidence,
+        category: bestMatch.category,
       });
     } else {
-      // General error handling for other issues (e.g., file parsing, multer issues)
-      res
-        .status(500)
-        .json({ message: "Upload or analysis failed", error: err.message });
+      unmappedColumns.push(header);
     }
-  } finally {
-    // IMPORTANT: Always delete the uploaded file to prevent disk space issues
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlink(filePath, (unlinkErr) => {
-        if (unlinkErr) {
-          console.error("Error deleting uploaded file:", unlinkErr);
-        } else {
-          console.log("Uploaded file deleted successfully:", filePath);
-        }
-      });
-    }
-  }
-});
+  });
 
-router.post("/correct-data", upload.single("file"), async (req, res) => {
-  let filePath;
-  console.log("Starting data correction process");
+  const overallConfidence =
+    mappings.length > 0
+      ? mappings.reduce((sum, m) => sum + m.confidence, 0) / mappings.length
+      : 0;
 
-  try {
-    if (!req.file) {
-      return res.status(400).json({ message: "No file uploaded!" });
-    }
-
-    const { industry = "general" } = req.body;
-    filePath = path.join("uploads", req.file.filename);
-
-    // Read the Excel file
-    const workbook = xlsx.readFile(filePath);
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const jsonData = xlsx.utils.sheet_to_json(sheet);
-
-    const columnNames = jsonData.length > 0 ? Object.keys(jsonData[0]) : [];
-
-    if (!columnNames.length) {
-      return res.status(400).json({
-        message: "No columns found in uploaded file.",
-        mappings: [],
-        unmappedColumns: [],
-      });
-    }
-
-    // Get first 5-10 rows as sample data for AI context
-    const sampleData = jsonData.slice(0, Math.min(10, jsonData.length));
-
-    // Get industry patterns
-    const patternList = industryPatterns[industry]?.patterns || [];
-    const patternInfo = patternList.map(
-      (p) => `- **${p.target}**: Matches → ${p.names.join(", ")}`
-    );
-
-    // Enhanced prompt with sample data
-    const prompt = `
-You are a data mapping specialist. Analyze the column names and sample data to map them to standardized names for the ${industry.toUpperCase()} industry.
-
-### AVAILABLE STANDARD PATTERNS FOR ${industry.toUpperCase()}:
-${
-  patternInfo.join("\n") || "(No specific patterns available for this industry)"
+  return {
+    mappings,
+    unmappedColumns,
+    industryType: detectedIndustry,
+    confidence: overallConfidence,
+  };
 }
 
-### COLUMN NAMES TO MAP:
-${JSON.stringify(columnNames, null, 2)}
+// Updated file validation function
+export const validateAndMapColumns = async (
+  file: File,
+  industryHint?: string
+): Promise<{
+  success: boolean;
+  mappingResult?: MappingResult;
+  headers?: string[];
+  error?: string;
+}> => {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
 
-### SAMPLE DATA (first few rows):
-${JSON.stringify(sampleData, null, 2)}
+    reader.onload = (e) => {
+      try {
+        const data = new Uint8Array(e.target?.result as ArrayBuffer);
+        const workbook = read(data, { type: "array" });
 
-### TASK:
-1. Analyze each column name and its sample data
-2. Match to the most appropriate standard pattern from the list above
-3. If no good match exists, return null for that column
-4. Consider data content, not just column names
+        const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
+        const headers = utils.sheet_to_json(firstSheet, {
+          header: 1,
+        })[0] as string[];
 
-### RESPONSE FORMAT:
-Return ONLY a valid JSON array with this exact structure:
-[
-  {
-    "originalName": "original_column_name",
-    "suggestedName": "StandardizedName",
-    "confidence": "high|medium|low",
-    "reason": "brief explanation of why this mapping was chosen"
-  }
-]
+        const normalizedHeaders = headers
+          .map((header) =>
+            typeof header === "string" ? header.trim() : String(header).trim()
+          )
+          .filter((header) => header !== "");
 
-### EXAMPLE:
-[
-  {
-    "originalName": "ord_id",
-    "suggestedName": "Order ID",
-    "confidence": "high",
-    "reason": "Clearly matches order identifier pattern"
-  },
-  {
-    "originalName": "weird_column",
-    "suggestedName": null,
-    "confidence": "low",
-    "reason": "No clear match found in available patterns"
-  }
-]
+        if (normalizedHeaders.length === 0) {
+          resolve({
+            success: false,
+            error: "No valid headers found in the file",
+          });
+          return;
+        }
 
-IMPORTANT: Return ONLY the JSON array, no explanations or markdown formatting.`;
+        const mappingResult = mapColumnsWithAI(normalizedHeaders, industryHint);
 
-    // Call AI service
-    const geminiRes = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyCxdJ8VnlRcvSQBEPRJ9NEMqcfmr7j0NcQ`,
-      {
-        contents: [
-          {
-            parts: [{ text: prompt }],
-          },
-        ],
-      }
-    );
-
-    let aiResponse = [];
-    let rawResponse = "";
-
-    try {
-      rawResponse =
-        geminiRes?.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      console.log("Raw AI Response:", rawResponse);
-
-      // Clean the response - remove markdown formatting if present
-      let cleanedResponse = rawResponse.trim();
-      if (cleanedResponse.startsWith("```json")) {
-        cleanedResponse = cleanedResponse
-          .replace(/```json\s*/, "")
-          .replace(/```\s*$/, "");
-      } else if (cleanedResponse.startsWith("```")) {
-        cleanedResponse = cleanedResponse
-          .replace(/```\s*/, "")
-          .replace(/```\s*$/, "");
-      }
-
-      aiResponse = JSON.parse(cleanedResponse);
-
-      if (!Array.isArray(aiResponse)) {
-        throw new Error("AI response is not an array");
-      }
-    } catch (parseError) {
-      console.error("Failed to parse AI response:", parseError);
-      console.error("Raw response was:", rawResponse);
-
-      // Fallback: create basic mapping
-      aiResponse = columnNames.map((col) => ({
-        originalName: col,
-        suggestedName: null,
-        confidence: "low",
-        reason: "AI parsing failed, manual mapping required",
-      }));
-    }
-
-    // Process the AI response to match frontend expectations
-    const mappings = [];
-    const unmappedColumns = [];
-
-    aiResponse.forEach((item) => {
-      if (item.suggestedName && item.suggestedName !== null) {
-        mappings.push({
-          originalName: item.originalName,
-          suggestedName: item.suggestedName,
-          confidence: item.confidence || "medium",
-          reason: item.reason || "AI suggested mapping",
+        resolve({
+          success: true,
+          mappingResult,
+          headers: normalizedHeaders,
         });
-      } else {
-        unmappedColumns.push(item.originalName);
+      } catch (error) {
+        resolve({
+          success: false,
+          error: "Error reading file: " + (error as Error).message,
+        });
       }
-    });
-
-    // Ensure all columns are accounted for
-    columnNames.forEach((col) => {
-      const found = aiResponse.find((item) => item.originalName === col);
-      if (!found) {
-        unmappedColumns.push(col);
-      }
-    });
-
-    // Response structure that matches frontend expectations
-    const response = {
-      message: "Column mapping completed successfully!",
-      originalFilename: req.file.originalname,
-      totalColumns: columnNames.length,
-      mappedColumns: mappings.length,
-      unmappedColumns: unmappedColumns.length,
-      industry: industry,
-      mappings: mappings,
-      unmappedColumns: unmappedColumns,
-      sampleDataProvided: sampleData.length > 0,
     };
 
-    console.log("Mapping completed:", {
-      total: columnNames.length,
-      mapped: mappings.length,
-      unmapped: unmappedColumns.length,
-    });
-
-    res.status(200).json(response);
-  } catch (err) {
-    console.error("Data correction failed:", err);
-    res.status(500).json({
-      message: "Column mapping failed",
-      error: err.message,
-      mappings: [],
-      unmappedColumns: [],
-      debug: {
-        hasFile: !!req.file,
-        industry: req.body?.industry || "not provided",
-      },
-    });
-  } finally {
-    // Clean up uploaded file
-    if (filePath && fs.existsSync(filePath)) {
-      fs.unlink(filePath, (unlinkErr) => {
-        if (unlinkErr) {
-          console.error("Error deleting uploaded file:", unlinkErr);
-        } else {
-          console.log("Uploaded file cleaned up successfully");
-        }
+    reader.onerror = () => {
+      resolve({
+        success: false,
+        error: "Error reading file",
       });
-    }
-  }
-});
+    };
 
-function validateIndustryPatterns(industry) {
-  const validIndustries = Object.keys(industryPatterns);
-  return validIndustries.includes(industry) ? industry : "general";
-}
+    reader.readAsArrayBuffer(file);
+  });
+};
